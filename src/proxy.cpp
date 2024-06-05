@@ -27,22 +27,28 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <ros/ros.h>
 #include <ros/console.h>
+#include <ros/ros.h>
 
 #include <tf/transform_listener.h>
 
-#include <interactive_markers/interactive_marker_client.h>
+#include <tf2_ros/buffer.h>
+
 #include <interactive_marker_proxy/GetInit.h>
+#include <interactive_markers/interactive_marker_client.h>
 
 using namespace interactive_markers;
 
-class Proxy
-{
+class Proxy {
 public:
   ros::NodeHandle nh_;
   ros::Publisher pub_;
-  tf::TransformListener tf_;
+  //   tf::TransformListener tf_;
+
+  tf2_ros::Buffer tf_buffer;
+  std::unique_ptr<tf2_ros::TransformListener>
+      tf_listener; // Use a smart pointer for automatic memory management
+
   interactive_markers::InteractiveMarkerClient client_;
   std::string topic_ns_;
   std::string target_frame_;
@@ -52,9 +58,13 @@ public:
 
   std::map<std::string, visualization_msgs::InteractiveMarker> int_markers_;
 
-  Proxy(std::string target_frame, std::string topic_ns) :
-      client_(tf_, target_frame, topic_ns), topic_ns_(topic_ns), target_frame_(target_frame)
-  {
+  Proxy(std::string target_frame, std::string topic_ns)
+      : client_(tf_buffer, target_frame, topic_ns), topic_ns_(topic_ns),
+        target_frame_(target_frame) {
+
+    tf_listener = std::make_unique<tf2_ros::TransformListener>(
+        tf_buffer); // Initialize the listener here
+
     ROS_INFO_STREAM("Subscribing to " << topic_ns);
     ROS_INFO_STREAM("Target frame set to " << target_frame);
 
@@ -64,64 +74,60 @@ public:
     client_.setStatusCb(boost::bind(&Proxy::statusCb, this, _1, _2, _3));
     client_.subscribe(topic_ns_);
 
-    pub_ = nh_.advertise<visualization_msgs::InteractiveMarkerUpdate>(topic_ns_ + "/tunneled/update", 1000);
+    pub_ = nh_.advertise<visualization_msgs::InteractiveMarkerUpdate>(
+        topic_ns_ + "/tunneled/update", 1000);
 
-    service_ = nh_.advertiseService(topic_ns_ + "/tunneled/get_init", &Proxy::getInit, this);
+    service_ = nh_.advertiseService(topic_ns_ + "/tunneled/get_init",
+                                    &Proxy::getInit, this);
 
     ros::NodeHandle private_nh("~");
     double update_rate;
     private_nh.param<double>("update_rate", update_rate, 30.0f);
-    timer_ = nh_.createTimer(ros::Duration(1.0 / update_rate), boost::bind(&Proxy::timerCb, this, _1));
+    timer_ = nh_.createTimer(ros::Duration(1.0 / update_rate),
+                             boost::bind(&Proxy::timerCb, this, _1));
   }
 
   typedef visualization_msgs::InteractiveMarkerInitConstPtr InitConstPtr;
   typedef visualization_msgs::InteractiveMarkerUpdateConstPtr UpdateConstPtr;
   typedef visualization_msgs::InteractiveMarkerUpdatePtr UpdatePtr;
 
-  void timerCb(const ros::TimerEvent&)
-  {
-    client_.update();
-  }
+  void timerCb(const ros::TimerEvent &) { client_.update(); }
 
-  bool getInit(interactive_marker_proxy::GetInit::Request& request,
-               interactive_marker_proxy::GetInit::Response& response)
-  {
+  bool getInit(interactive_marker_proxy::GetInit::Request &request,
+               interactive_marker_proxy::GetInit::Response &response) {
     ROS_INFO("Init requested.");
-    std::vector< visualization_msgs::InteractiveMarker > markers;
+    std::vector<visualization_msgs::InteractiveMarker> markers;
     std::map<std::string, visualization_msgs::InteractiveMarker>::iterator it;
-    for( it = int_markers_.begin(); it!=int_markers_.end(); it++ )
-    {
+    for (it = int_markers_.begin(); it != int_markers_.end(); it++) {
       response.msg.markers.push_back(it->second);
     }
     return true;
   }
 
-  void updateCb(const UpdateConstPtr& up_msg)
-  {
-    const visualization_msgs::InteractiveMarkerUpdate::_erases_type& erases = up_msg->erases;
-    for (unsigned i = 0; i < erases.size(); i++)
-    {
+  void updateCb(const UpdateConstPtr &up_msg) {
+    const visualization_msgs::InteractiveMarkerUpdate::_erases_type &erases =
+        up_msg->erases;
+    for (unsigned i = 0; i < erases.size(); i++) {
       int_markers_.erase(erases[i]);
     }
 
-    const visualization_msgs::InteractiveMarkerUpdate::_poses_type& poses = up_msg->poses;
-    for (unsigned i = 0; i < poses.size(); i++)
-    {
+    const visualization_msgs::InteractiveMarkerUpdate::_poses_type &poses =
+        up_msg->poses;
+    for (unsigned i = 0; i < poses.size(); i++) {
       int_markers_[poses[i].name].pose = poses[i].pose;
       int_markers_[poses[i].name].header = poses[i].header;
     }
 
-    const visualization_msgs::InteractiveMarkerUpdate::_markers_type& markers = up_msg->markers;
-    for (unsigned i = 0; i < markers.size(); i++)
-    {
+    const visualization_msgs::InteractiveMarkerUpdate::_markers_type &markers =
+        up_msg->markers;
+    for (unsigned i = 0; i < markers.size(); i++) {
       int_markers_[markers[i].name] = markers[i];
     }
 
     pub_.publish(up_msg);
   }
 
-  void initCb(const InitConstPtr& init_msg)
-  {
+  void initCb(const InitConstPtr &init_msg) {
     UpdatePtr update(new visualization_msgs::InteractiveMarkerUpdate());
     update->markers = init_msg->markers;
     update->seq_num = init_msg->seq_num;
@@ -131,29 +137,45 @@ public:
     updateCb(update);
   }
 
-  void statusCb(InteractiveMarkerClient::StatusT status, const std::string& server_id, const std::string& status_text)
-  {
-    if ( status_text_.find(server_id) != status_text_.end() &&
-         status_text_[server_id] == status_text )
-    {
+  void statusCb(InteractiveMarkerClient::StatusT status,
+                const std::string &server_id, const std::string &status_text) {
+    if (status_text_.find(server_id) != status_text_.end() &&
+        status_text_[server_id] == status_text) {
       return;
     }
     status_text_[server_id] = status_text;
     std::string status_string[] = {"INFO", "WARN", "ERROR"};
-    ROS_INFO_STREAM( "(" << status_string[(unsigned)status] << ") " << server_id << ": " << status_text);
+    ROS_INFO_STREAM("(" << status_string[(unsigned)status] << ") " << server_id
+                        << ": " << status_text);
   }
 
-  void resetCb(const std::string& server_id)
-  {
-  }
+  void resetCb(const std::string &server_id) {}
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
   ros::init(argc, argv, "interactive_marker_proxy");
   {
     ros::NodeHandle nh;
-    Proxy proxy(nh.resolveName("target_frame"), nh.resolveName("topic_ns"));
+
+    ros::NodeHandle private_nh(
+        "~"); // Private node handle for retrieving private parameters
+
+    // Getting target_frame param
+    std::string target_frame;
+    if (!private_nh.getParam("target_frame", target_frame)) {
+      ROS_WARN("No 'target_frame' parameter specified; defaulting to "
+               "'default_frame'.");
+      target_frame = "default_frame"; // Default value if not set
+    }
+
+    // Assuming topic_ns is also intended to be a private parameter
+    std::string topic_ns;
+    if (!private_nh.getParam("topic_ns", topic_ns)) {
+      ROS_WARN("No 'topic_ns' parameter specified; defaulting to '/topic_ns'.");
+      topic_ns = "/topic_ns"; // Default value if not set
+    }
+
+    Proxy proxy(target_frame, topic_ns);
     ros::spin();
   }
 }
